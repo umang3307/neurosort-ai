@@ -100,7 +100,7 @@ Deployed with Cloud Run: **https://neurosort-ai.streamlit.app/**
 
 ## Demo video
 
-**[add your video link here]**
+**https://youtu.be/kjdoVMu-eWw**
 
 ## Limitations & honest tradeoffs
 
