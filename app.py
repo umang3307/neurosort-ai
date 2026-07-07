@@ -1,103 +1,143 @@
+"""
+app.py
+------
+Streamlit front end for NeuroSort AI. This file is deliberately thin — all
+agent logic lives in agent.py, storage logic in storage.py, and input
+safety in guardrails.py — so the UI layer stays easy to read and test.
+"""
+
+import os
+
 import streamlit as st
-import google.generativeai as genai
-import json
 
-# --- 1. DEFINE AGENT SKILLS (NeuroSort Core Routers) ---
-def route_to_do_now(task: str, urgency_reason: str) -> str:
-    """Use for critical, time-sensitive tasks that require immediate execution."""
-    return f"🚀 [CRITICAL] {task} | Reason: {urgency_reason}"
+import storage
+from agent import run_triage
+from guardrails import InputTooLongError, flag_injection_attempt, sanitize_input
 
-def route_to_schedule(task: str, suggested_timeframe: str) -> str:
-    """Use for high-value strategic tasks that must be planned for later."""
-    return f"📅 [SCHEDULED] {task} | Timeframe: {suggested_timeframe}"
-
-def route_to_delegate(task: str, suggested_role: str) -> str:
-    """Use for operational tasks that should be handed off to someone else or automated."""
-    return f"🤝 [DELEGATED] {task} | Target Role: {suggested_role}"
-
-def route_to_delete(task: str, elimination_justification: str) -> str:
-    """Use for anxieties, non-actionable clutter, or low-value distractions."""
-    return f"🗑️ [ELIMINATED] {task} | Justification: {elimination_justification}"
-
-# --- 2. ADVANCED UI CONFIGURATION ---
-st.set_page_config(
-    page_title="NeuroSort AI - Cognitive Triage Agent", 
-    page_icon="🧠", 
-    layout="wide"
-)
+st.set_page_config(page_title="NeuroSort AI", page_icon="🧠", layout="wide")
+storage.init_db()
 
 st.title("🧠 NeuroSort AI")
-st.subheader("Advanced Cognitive Triage & Autonomous Task Distillation")
-st.write("An intelligent concierge agent designed to ingest unstructured, chaotic mental streams and systematically map them to actionable execution matrix nodes using native tool routing.")
-
-# Sidebar for configuration
-with st.sidebar:
-    st.header("Settings")
-    api_key = st.text_input("Gemini API Key:", type="password")
-    st.markdown("---")
-    st.markdown("### Agent Profile")
-    st.info("**Model:** gemini-1.5-flash\n\n**Architecture:** Function-Driven Tool Routing\n\n**Domain:** Cognitive Productivity")
-
-# Main Interface Layout
-user_input = st.text_area(
-    "Unload your thoughts, tasks, and anxieties here:", 
-    placeholder="Example: I'm completely overwhelmed. The Q3 financial report is due to investors tomorrow morning and I haven't finished the summary. I also need to buy groceries tonight. I keep stressing about booking flights for a vacation in three months, and my team keeps asking me to review their code but I don't have time...",
-    height=180
+st.caption(
+    "Dump every task, worry, and idea in your head. NeuroSort triages it into "
+    "what to do now, what to schedule, what to delegate, and what to let go of "
+    "— and actually creates the calendar event / draft email for you."
 )
 
-# --- 3. AGENT ORCHESTRATION ---
-if st.button("Initialize Cognitive Triage") and api_key and user_input:
-    genai.configure(api_key=api_key)
-    
-    # Registering the toolset
-    model = genai.GenerativeModel(
-        model_name='gemini-1.5-flash',
-        tools=[route_to_do_now, route_to_schedule, route_to_delegate, route_to_delete]
+with st.sidebar:
+    st.subheader("Setup")
+    api_key = st.text_input(
+        "Gemini API key",
+        type="password",
+        value=os.environ.get("GEMINI_API_KEY", ""),
+        help="Get a free key at aistudio.google.com. Never shared or logged.",
     )
-    
-    with st.spinner("🧠 NeuroSort Agent is analyzing cognitive patterns and mapping execution paths..."):
+    st.divider()
+    st.subheader("Your history")
+    stats = storage.get_stats()
+    st.metric("Tasks triaged (all time)", stats["total_tasks"])
+    if stats["avg_cognitive_load"] is not None:
+        st.metric("Avg. cognitive load score", stats["avg_cognitive_load"])
+    for cat, count in stats["by_category"].items():
+        st.write(f"- **{cat}**: {count}")
+
+brain_dump = st.text_area(
+    "What's on your mind?",
+    height=200,
+    placeholder=(
+        "e.g. Need to reply to Sarah about the invoice today, dentist appointment "
+        "next Tuesday, ask Raj to review the PR, keep thinking about whether to "
+        "repaint the kitchen..."
+    ),
+)
+
+col1, col2 = st.columns([1, 5])
+with col1:
+    submit = st.button("Triage it", type="primary", use_container_width=True)
+
+if submit:
+    if not api_key:
+        st.error("Add your Gemini API key in the sidebar first.")
+    elif not brain_dump.strip():
+        st.warning("Type something to triage.")
+    else:
         try:
-            # Open an explicit chat session with automatic tool execution enabled
-            chat = model.start_chat(enable_automatic_function_calling=True)
-            
-            system_orchestrator_prompt = f"""
-            You are NeuroSort AI, an advanced cognitive triage agent specializing in decompression and task automation.
-            Analyze the following unstructured user stream-of-consciousness data:
-            
-            "{user_input}"
-            
-            CRITICAL OBJECTIVES:
-            1. Parse the text completely. Identify every single unique hidden task, stressor, or objective.
-            2. For each identified item, invoke the most appropriate routing tool from your toolkit (`route_to_do_now`, `route_to_schedule`, `route_to_delegate`, `route_to_delete`). Do not skip any item.
-            3. Once all tools have successfully executed, provide a masterful executive analysis report summarizing the triage strategy. Give a calculated 'Cognitive Load Index Score' out of 100 based on the complexity and volume of the input text, and provide brief, highly actionable advice for the user's focus.
-            """
-            
-            response = chat.send_message(system_orchestrator_prompt)
-            
-            # Display Results in a beautiful, structured presentation
-            st.success("Triage Protocol Complete.")
-            
-            col1, col2 = st.columns([2, 1])
-            
-            with col1:
-                st.markdown("### 📊 Executive Focus & Analysis")
-                st.write(response.text)
-                
-            with col2:
-                st.markdown("### 🛠️ Execution Trace Log")
-                st.caption("This shows the chronological tool invocations handled autonomously by the agent.")
-                
-                # Extract and display the tool calls from the chat history to show the judges the tech works
-                tool_calls_found = False
-                for event in chat.history:
-                    for part in event.parts:
-                        if part.function_call:
-                            tool_calls_found = True
-                            st.code(f"Tool Triggered: {part.function_call.name}\nArgs: {json.dumps(dict(part.function_call.args), indent=2)}")
-                
-                if not tool_calls_found:
-                    st.warning("No discrete tools were triggered. Try giving a mix of urgent tasks, long-term plans, and clear distractions.")
-                    
-        except Exception as e:
-            st.error(f"An error occurred during runtime: {str(e)}")
-            st.info("Verify your API key is correct and your input text contains clear actionable/non-actionable scenarios.")
+            cleaned = sanitize_input(brain_dump)
+        except InputTooLongError as e:
+            st.error(str(e))
+            st.stop()
+
+        if flag_injection_attempt(cleaned):
+            st.warning(
+                "Heads up: your text matched a pattern commonly used in prompt "
+                "injection attempts. NeuroSort will still treat it strictly as "
+                "data to triage, not as instructions — but flagging this for "
+                "transparency."
+            )
+
+        with st.spinner("Triaging..."):
+            try:
+                run = run_triage(api_key=api_key, brain_dump_text=cleaned)
+            except Exception as e:
+                st.error(f"Something went wrong calling Gemini: {e}")
+                st.stop()
+
+        if run.cognitive_load_score is not None:
+            st.subheader(f"Cognitive Load: {run.cognitive_load_score}/100")
+            st.caption(run.cognitive_load_rationale)
+
+        buckets = {"do_now_task": [], "schedule_task": [], "delegate_task": [], "archive_task": []}
+        for call in run.calls:
+            buckets.setdefault(call.tool_name, []).append(call)
+
+        col_now, col_sched, col_deleg, col_arch = st.columns(4)
+
+        with col_now:
+            st.markdown("### ⚡ Do now")
+            for c in buckets["do_now_task"]:
+                st.success(c.result["task"])
+
+        with col_sched:
+            st.markdown("### 📅 Scheduled")
+            for c in buckets["schedule_task"]:
+                st.info(f"{c.result['task']} — *{c.result['when_requested']}*")
+                with open(c.result["ics_path"], "rb") as f:
+                    st.download_button(
+                        "Download .ics",
+                        f.read(),
+                        file_name=os.path.basename(c.result["ics_path"]),
+                        mime="text/calendar",
+                        key=f"ics_{c.result['task_id']}",
+                    )
+
+        with col_deleg:
+            st.markdown("### 📤 Delegated")
+            for c in buckets["delegate_task"]:
+                st.info(f"{c.result['task']} → **{c.result['recipient_hint']}**")
+                with open(c.result["eml_path"], "rb") as f:
+                    st.download_button(
+                        "Download draft email",
+                        f.read(),
+                        file_name=os.path.basename(c.result["eml_path"]),
+                        mime="message/rfc822",
+                        key=f"eml_{c.result['task_id']}",
+                    )
+
+        with col_arch:
+            st.markdown("### 🗄️ Archived")
+            for c in buckets["archive_task"]:
+                st.write(c.result["task"])
+
+        if not run.calls:
+            st.warning(
+                "The model didn't triage anything. Try describing at least one "
+                "concrete task or idea."
+            )
+
+st.divider()
+with st.expander("📜 Full history (persisted across sessions)"):
+    history = storage.get_history(limit=50)
+    if not history:
+        st.write("No history yet.")
+    for row in history:
+        st.write(f"`{row['created_at'][:19]}` **[{row['category']}]** {row['content']}")
