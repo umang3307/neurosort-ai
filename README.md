@@ -96,7 +96,7 @@ pytest tests/ -v
 
 ## Deployment
 
-Deployed with Cloud Run: **[add your deployed URL here]**
+Deployed with Cloud Run: **https://neurosort-ai.streamlit.app/**
 
 ## Demo video
 
