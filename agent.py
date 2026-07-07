@@ -23,7 +23,6 @@ in guardrails.py.
 
 from __future__ import annotations
 
-import json
 import re
 import time
 import uuid
@@ -281,52 +280,34 @@ def run_triage(api_key: str, brain_dump_text: str) -> TriageRun:
     contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
 
     run = TriageRun()
-    # We prompt the model to issue all tool calls in one turn (see
-    # SYSTEM_INSTRUCTIONS), so this should usually resolve in 1 iteration.
-    # We still cap it defensively at 4 in case the model splits work across
-    # turns, so a misbehaving model can't spin forever burning API calls
-    # and hitting free-tier rate limits.
-    for _ in range(4):
-        response = _call_with_retry(
-            client, MODEL_NAME, contents, config
-        )
 
-        candidate = response.candidates[0] if response.candidates else None
-        if not candidate or not candidate.content or not candidate.content.parts:
-            break
+    # Single call: we've prompted the model to issue every tool call it
+    # needs (one per task, plus the cognitive-load estimate) in this one
+    # turn. We deliberately do NOT loop back for a second turn — because
+    # tool_config mode="ANY" forces a function call on every turn, looping
+    # back would force the model to re-triage the same tasks again and
+    # again (duplicate side effects, duplicate files, wasted API calls).
+    response = _call_with_retry(client, MODEL_NAME, contents, config)
 
+    candidate = response.candidates[0] if response.candidates else None
+    function_calls = []
+    if candidate and candidate.content and candidate.content.parts:
         function_calls = [
             part.function_call for part in candidate.content.parts if part.function_call
         ]
-        if not function_calls:
-            break
 
-        contents.append(candidate.content)
-        function_response_parts = []
+    for fc in function_calls:
+        fn = TOOL_FUNCTIONS.get(fc.name)
+        args = dict(fc.args) if fc.args else {}
+        if fn is None:
+            continue
+        result = fn(**args)
 
-        for fc in function_calls:
-            fn = TOOL_FUNCTIONS.get(fc.name)
-            args = dict(fc.args) if fc.args else {}
-            if fn is None:
-                result = {"error": f"unknown tool {fc.name}"}
-            else:
-                result = fn(**args)
-
-            if fc.name == "estimate_cognitive_load":
-                run.cognitive_load_score = result.get("score")
-                run.cognitive_load_rationale = result.get("rationale", "")
-            else:
-                run.calls.append(TriageResult(tool_name=fc.name, args=args, result=result))
-
-            function_response_parts.append(
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        name=fc.name, response={"result": json.dumps(result)}
-                    )
-                )
-            )
-
-        contents.append(types.Content(role="tool", parts=function_response_parts))
+        if fc.name == "estimate_cognitive_load":
+            run.cognitive_load_score = result.get("score")
+            run.cognitive_load_rationale = result.get("rationale", "")
+        else:
+            run.calls.append(TriageResult(tool_name=fc.name, args=args, result=result))
 
     if run.cognitive_load_score is not None:
         storage.log_session(brain_dump_text, run.cognitive_load_score)
