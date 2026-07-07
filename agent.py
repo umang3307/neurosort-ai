@@ -24,6 +24,8 @@ in guardrails.py.
 from __future__ import annotations
 
 import json
+import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,9 +51,10 @@ For EVERY distinct task or item you find in the text, call exactly one tool:
   - delegate_task: for anything that should be handed off to another person
   - archive_task: for anything that is just a note, worry, or idea with no required action
 
-Call the appropriate tool once per distinct task. Do not summarize instead of calling
-tools. After triaging everything, call estimate_cognitive_load exactly once with your
-estimate of how mentally overloaded the input sounds (0-100)."""
+IMPORTANT: Issue ALL of these tool calls together in a single response, in parallel —
+one function call per task, plus one final call to estimate_cognitive_load for the
+whole input — rather than spreading them across multiple turns. Do not summarize
+instead of calling tools."""
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +223,30 @@ TOOL_DECLARATIONS = [
 ]
 
 
+def _call_with_retry(client, model, contents, config, max_attempts: int = 3):
+    """
+    Call generate_content with automatic backoff on 429 RESOURCE_EXHAUSTED
+    (free-tier rate limits). Google's error payload includes a suggested
+    retryDelay in seconds — we honor that instead of guessing.
+    """
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        except Exception as e:  # noqa: BLE001 - SDK raises plain Exceptions for HTTP errors
+            last_error = e
+            message = str(e)
+            if "RESOURCE_EXHAUSTED" not in message and "429" not in message:
+                raise
+            match = re.search(r"retryDelay['\"]?:\s*['\"]?(\d+)", message)
+            wait_seconds = int(match.group(1)) if match else 15
+            if attempt < max_attempts - 1:
+                time.sleep(wait_seconds + 1)
+    raise last_error
+
+
 @dataclass
 class TriageResult:
     tool_name: str
@@ -254,12 +281,14 @@ def run_triage(api_key: str, brain_dump_text: str) -> TriageRun:
     contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
 
     run = TriageRun()
-    # Loop: the model may issue several function calls across a couple of
-    # turns. We cap iterations defensively so a misbehaving model can't
-    # spin forever burning API calls.
-    for _ in range(10):
-        response = client.models.generate_content(
-            model=MODEL_NAME, contents=contents, config=config
+    # We prompt the model to issue all tool calls in one turn (see
+    # SYSTEM_INSTRUCTIONS), so this should usually resolve in 1 iteration.
+    # We still cap it defensively at 4 in case the model splits work across
+    # turns, so a misbehaving model can't spin forever burning API calls
+    # and hitting free-tier rate limits.
+    for _ in range(4):
+        response = _call_with_retry(
+            client, MODEL_NAME, contents, config
         )
 
         candidate = response.candidates[0] if response.candidates else None
