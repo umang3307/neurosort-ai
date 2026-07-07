@@ -68,12 +68,9 @@ if submit:
             st.stop()
 
         if flag_injection_attempt(cleaned):
-            st.warning(
-                "Heads up: your text matched a pattern commonly used in prompt "
-                "injection attempts. NeuroSort will still treat it strictly as "
-                "data to triage, not as instructions — but flagging this for "
-                "transparency."
-            )
+            st.session_state["injection_warning"] = True
+        else:
+            st.session_state["injection_warning"] = False
 
         with st.spinner("Triaging..."):
             try:
@@ -82,57 +79,72 @@ if submit:
                 st.error(f"Something went wrong calling Gemini: {e}")
                 st.stop()
 
-        if run.cognitive_load_score is not None:
-            st.subheader(f"Cognitive Load: {run.cognitive_load_score}/100")
-            st.caption(run.cognitive_load_rationale)
+        # Store the result in session state (not just a local variable) so
+        # it survives the rerun below and the sidebar's task count reflects
+        # this run immediately instead of staying one run behind.
+        st.session_state["last_run"] = run
+        st.rerun()
 
-        buckets = {"do_now_task": [], "schedule_task": [], "delegate_task": [], "archive_task": []}
-        for call in run.calls:
-            buckets.setdefault(call.tool_name, []).append(call)
+if st.session_state.get("injection_warning"):
+    st.warning(
+        "Heads up: your last input matched a pattern commonly used in prompt "
+        "injection attempts. NeuroSort still treats it strictly as data to "
+        "triage, not as instructions — flagging this for transparency."
+    )
 
-        col_now, col_sched, col_deleg, col_arch = st.columns(4)
+run = st.session_state.get("last_run")
+if run is not None:
+    if run.cognitive_load_score is not None:
+        st.subheader(f"Cognitive Load: {run.cognitive_load_score}/100")
+        st.caption(run.cognitive_load_rationale)
 
-        with col_now:
-            st.markdown("### ⚡ Do now")
-            for c in buckets["do_now_task"]:
-                st.success(c.result["task"])
+    buckets = {"do_now_task": [], "schedule_task": [], "delegate_task": [], "archive_task": []}
+    for call in run.calls:
+        buckets.setdefault(call.tool_name, []).append(call)
 
-        with col_sched:
-            st.markdown("### 📅 Scheduled")
-            for c in buckets["schedule_task"]:
-                st.info(f"{c.result['task']} — *{c.result['when_requested']}*")
-                with open(c.result["ics_path"], "rb") as f:
-                    st.download_button(
-                        "Download .ics",
-                        f.read(),
-                        file_name=os.path.basename(c.result["ics_path"]),
-                        mime="text/calendar",
-                        key=f"ics_{c.result['task_id']}",
-                    )
+    col_now, col_sched, col_deleg, col_arch = st.columns(4)
 
-        with col_deleg:
-            st.markdown("### 📤 Delegated")
-            for c in buckets["delegate_task"]:
-                st.info(f"{c.result['task']} → **{c.result['recipient_hint']}**")
-                with open(c.result["eml_path"], "rb") as f:
-                    st.download_button(
-                        "Download draft email",
-                        f.read(),
-                        file_name=os.path.basename(c.result["eml_path"]),
-                        mime="message/rfc822",
-                        key=f"eml_{c.result['task_id']}",
-                    )
+    with col_now:
+        st.markdown("### ⚡ Do now")
+        for c in buckets["do_now_task"]:
+            st.success(c.result["task"])
 
-        with col_arch:
-            st.markdown("### 🗄️ Archived")
-            for c in buckets["archive_task"]:
-                st.write(c.result["task"])
+    with col_sched:
+        st.markdown("### 📅 Scheduled")
+        for c in buckets["schedule_task"]:
+            st.info(f"{c.result['task']} — *{c.result['when_requested']}*")
+            with open(c.result["ics_path"], "rb") as f:
+                st.download_button(
+                    "Download .ics",
+                    f.read(),
+                    file_name=os.path.basename(c.result["ics_path"]),
+                    mime="text/calendar",
+                    key=f"ics_{c.result['task_id']}",
+                )
 
-        if not run.calls:
-            st.warning(
-                "The model didn't triage anything. Try describing at least one "
-                "concrete task or idea."
-            )
+    with col_deleg:
+        st.markdown("### 📤 Delegated")
+        for c in buckets["delegate_task"]:
+            st.info(f"{c.result['task']} → **{c.result['recipient_hint']}**")
+            with open(c.result["eml_path"], "rb") as f:
+                st.download_button(
+                    "Download draft email",
+                    f.read(),
+                    file_name=os.path.basename(c.result["eml_path"]),
+                    mime="message/rfc822",
+                    key=f"eml_{c.result['task_id']}",
+                )
+
+    with col_arch:
+        st.markdown("### 🗄️ Archived")
+        for c in buckets["archive_task"]:
+            st.write(c.result["task"])
+
+    if not run.calls:
+        st.warning(
+            "The model didn't triage anything. Try describing at least one "
+            "concrete task or idea."
+        )
 
 st.divider()
 with st.expander("📜 Full history (persisted across sessions)"):
